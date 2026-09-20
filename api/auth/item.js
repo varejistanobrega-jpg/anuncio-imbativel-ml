@@ -1,17 +1,27 @@
-import { neon } from "@neondatabase/serverless";
-import { decryptToken } from "./crypto.js";
+import { getAuthenticatedSession } from "./session.js";
+import { getValidMeliAccessToken } from "../../lib/meli-token.js";
 
 export default async function handler(req, res) {
   try {
-    const userId = String(req.query.user_id || "");
-    const itemId = String(req.query.item_id || "").toUpperCase();
+    if (req.method !== "GET") {
+      res.setHeader("Allow", "GET");
 
-    if (!/^\d+$/.test(userId)) {
-      return res.status(400).json({
+      return res.status(405).json({
         ok: false,
-        error: "user_id inválido"
+        error: "Método não permitido"
       });
     }
+
+    const session = await getAuthenticatedSession(req);
+
+    if (!session) {
+      return res.status(401).json({
+        ok: false,
+        error: "Sessão não autenticada ou expirada"
+      });
+    }
+
+    const itemId = String(req.query.item_id || "").toUpperCase();
 
     if (!/^MLB\d+$/.test(itemId)) {
       return res.status(400).json({
@@ -20,34 +30,7 @@ export default async function handler(req, res) {
       });
     }
 
-    const databaseUrl = process.env.DATABASE_URL;
-
-    if (!databaseUrl) {
-      return res.status(500).json({
-        ok: false,
-        error: "Conexão com o banco não encontrada"
-      });
-    }
-
-    const sql = neon(databaseUrl);
-
-    const rows = await sql`
-      SELECT
-        ml_user_id,
-        access_token
-      FROM mercado_livre_accounts
-      WHERE ml_user_id = ${userId}
-      LIMIT 1
-    `;
-
-    if (rows.length === 0) {
-      return res.status(404).json({
-        ok: false,
-        error: "Conta Mercado Livre não encontrada"
-      });
-    }
-
-    const accessToken = decryptToken(rows[0].access_token);
+    const accessToken = await getValidMeliAccessToken(session.mlUserId);
 
     const response = await fetch(
       `https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`,
@@ -70,18 +53,17 @@ export default async function handler(req, res) {
       });
     }
 
-    // Segurança multi-vendedor:
-    // impede usar a conta autenticada de um vendedor
-    // para consultar como próprio um anúncio de outro vendedor.
     if (
       data.seller_id &&
-      String(data.seller_id) !== userId
+      String(data.seller_id) !== String(session.mlUserId)
     ) {
       return res.status(403).json({
         ok: false,
-        error: "O anúncio não pertence à conta Mercado Livre informada"
+        error: "O anúncio não pertence à conta Mercado Livre autenticada"
       });
     }
+
+    res.setHeader("Cache-Control", "no-store");
 
     return res.status(200).json({
       ok: true,
