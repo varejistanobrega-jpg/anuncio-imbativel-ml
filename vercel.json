@@ -7,6 +7,10 @@
     {
       "source": "/api/auth/user-product",
       "destination": "/api/auth/item?view=user_product"
+    },
+    {
+      "source": "/api/auth/family-name",
+      "destination": "/api/auth/item"
     }
   ]
 }
