@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/auth/seller-items",
+      "destination": "/api/auth/items?mode=seller_items"
+    }
+  ]
+}
