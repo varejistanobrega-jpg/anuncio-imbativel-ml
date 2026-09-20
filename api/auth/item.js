@@ -3,6 +3,7 @@ import { getValidMeliAccessToken } from "../../lib/meli-token.js";
 
 const DESCRIPTION_ALLOWED_BODY_KEYS = new Set(["item_id", "plain_text"]);
 const TITLE_ALLOWED_BODY_KEYS = new Set(["item_id", "title"]);
+const FAMILY_NAME_ALLOWED_BODY_KEYS = new Set(["item_id", "family_name"]);
 const MAX_TITLE_LENGTH = 60;
 
 function normalizeItemId(value) {
@@ -978,7 +979,8 @@ async function handlePatch(req, res) {
       }
     });
   }
-    /*
+
+  /*
    * BARREIRA 4:
    * fluxo de título direto somente para
    * anúncio sem vendas.
@@ -1009,8 +1011,7 @@ async function handlePatch(req, res) {
       }
     });
   }
-
-  /*
+    /*
    * PAYLOAD MÍNIMO E ISOLADO.
    *
    * O Mercado Livre recebe SOMENTE title.
@@ -1139,6 +1140,945 @@ async function handlePatch(req, res) {
   });
 }
 
+function validateFamilyNameBody(body) {
+  if (
+    !body ||
+    typeof body !== "object" ||
+    Array.isArray(body)
+  ) {
+    throw new Error(
+      "Corpo da solicitação inválido"
+    );
+  }
+
+  /*
+   * ALLOWLIST ABSOLUTA.
+   *
+   * Este fluxo aceita SOMENTE:
+   * item_id
+   * family_name
+   *
+   * SELLER_SKU/SKU e qualquer outro campo
+   * são rejeitados antes de qualquer escrita.
+   */
+  const receivedKeys = Object.keys(body);
+
+  const forbiddenKeys = receivedKeys.filter(
+    (key) =>
+      !FAMILY_NAME_ALLOWED_BODY_KEYS.has(key)
+  );
+
+  if (forbiddenKeys.length > 0) {
+    throw new Error(
+      `Campos não autorizados na atualização de family_name: ${forbiddenKeys.join(
+        ", "
+      )}`
+    );
+  }
+
+  const itemId = normalizeItemId(body.item_id);
+
+  if (!/^MLB\d+$/.test(itemId)) {
+    throw new Error("item_id inválido");
+  }
+
+  if (typeof body.family_name !== "string") {
+    throw new Error(
+      "family_name deve ser uma string"
+    );
+  }
+
+  /*
+   * Não alteramos silenciosamente o valor
+   * solicitado pelo usuário.
+   */
+  if (body.family_name.trim().length === 0) {
+    throw new Error(
+      "family_name não pode estar vazio"
+    );
+  }
+
+  return {
+    item_id: itemId,
+    family_name: body.family_name
+  };
+}
+
+async function handlePutFamilyName(req, res) {
+  let validated;
+
+  /*
+   * BARREIRA 1:
+   * estrutura + allowlist absoluta.
+   */
+  try {
+    validated = validateFamilyNameBody(req.body);
+  } catch (error) {
+    return res.status(400).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Solicitação inválida"
+    });
+  }
+
+  /*
+   * BARREIRA 2:
+   * sessão autenticada + propriedade
+   * do anúncio usado como referência.
+   */
+  const loaded = await authenticateAndLoadItem(
+    req,
+    validated.item_id
+  );
+
+  if (loaded.error) {
+    return res
+      .status(loaded.error.status)
+      .json(loaded.error.body);
+  }
+
+  const {
+    session,
+    accessToken,
+    itemId,
+    item
+  } = loaded;
+
+  const userProductId =
+    typeof item.user_product_id === "string"
+      ? item.user_product_id.trim()
+      : "";
+
+  const itemFamilyId =
+    item.family_id !== undefined &&
+    item.family_id !== null
+      ? String(item.family_id).trim()
+      : "";
+
+  const beforeItemFamilyName =
+    typeof item.family_name === "string"
+      ? item.family_name
+      : null;
+
+  /*
+   * BARREIRA 3:
+   * o anúncio precisa pertencer ao modelo
+   * User Products e possuir os identificadores
+   * necessários.
+   */
+  if (!/^MLBU\d+$/.test(userProductId)) {
+    return res.status(422).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      item_id: itemId,
+      reason: "USER_PRODUCT_ID_MISSING",
+      error:
+        "O anúncio não possui user_product_id válido; nenhuma alteração foi executada",
+      user_product_id: userProductId || null,
+      family_id: itemFamilyId || null,
+      before: {
+        family_name: beforeItemFamilyName
+      },
+      requested: {
+        family_name: validated.family_name
+      }
+    });
+  }
+
+  if (
+    !itemFamilyId ||
+    !/^\d+$/.test(itemFamilyId)
+  ) {
+    return res.status(422).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      item_id: itemId,
+      reason: "FAMILY_ID_MISSING",
+      error:
+        "O anúncio não possui family_id válido; nenhuma alteração foi executada",
+      user_product_id: userProductId,
+      family_id: itemFamilyId || null,
+      before: {
+        family_name: beforeItemFamilyName
+      },
+      requested: {
+        family_name: validated.family_name
+      }
+    });
+  }
+
+  if (
+    typeof beforeItemFamilyName !== "string" ||
+    beforeItemFamilyName.trim().length === 0
+  ) {
+    return res.status(422).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      item_id: itemId,
+      reason: "FAMILY_NAME_MISSING",
+      error:
+        "O anúncio não possui family_name atual válido; nenhuma alteração foi executada",
+      user_product_id: userProductId,
+      family_id: itemFamilyId,
+      before: {
+        family_name: beforeItemFamilyName
+      },
+      requested: {
+        family_name: validated.family_name
+      }
+    });
+  }
+
+  /*
+   * BARREIRA 4:
+   * consulta o User Product e confirma
+   * a família efetiva antes de prosseguir.
+   */
+  const userProductResult = await requestMercadoLivre(
+    `https://api.mercadolibre.com/user-products/${encodeURIComponent(
+      userProductId
+    )}`,
+    accessToken
+  );
+
+  if (
+    !userProductResult.ok ||
+    !userProductResult.data
+  ) {
+    return res.status(422).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      item_id: itemId,
+      reason: "USER_PRODUCT_UNREADABLE",
+      error:
+        "Não foi possível validar o User Product; nenhuma alteração foi executada",
+      user_product_id: userProductId,
+      family_id: itemFamilyId,
+      user_product_http_status:
+        userProductResult.http_status,
+      before: {
+        family_name: beforeItemFamilyName
+      },
+      requested: {
+        family_name: validated.family_name
+      }
+    });
+  }
+
+  const userProductFamilyId =
+    userProductResult.data.family_id !== undefined &&
+    userProductResult.data.family_id !== null
+      ? String(
+          userProductResult.data.family_id
+        ).trim()
+      : "";
+
+  /*
+   * O item e o User Product precisam apontar
+   * para a mesma família.
+   */
+  if (
+    !userProductFamilyId ||
+    userProductFamilyId !== itemFamilyId
+  ) {
+    return res.status(409).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      item_id: itemId,
+      reason: "FAMILY_ID_MISMATCH",
+      error:
+        "O family_id do anúncio diverge do family_id do User Product; nenhuma alteração foi executada",
+      user_product_id: userProductId,
+      item_family_id: itemFamilyId,
+      user_product_family_id:
+        userProductFamilyId || null,
+      before: {
+        family_name: beforeItemFamilyName
+      },
+      requested: {
+        family_name: validated.family_name
+      }
+    });
+  }
+
+  const familyId = userProductFamilyId;
+
+  /*
+   * BARREIRA 5:
+   * consulta a família e valida propriedade.
+   */
+  const familyResult = await requestMercadoLivre(
+    `https://api.mercadolibre.com/user-products-families/${encodeURIComponent(
+      familyId
+    )}`,
+    accessToken
+  );
+
+  if (
+    !familyResult.ok ||
+    !familyResult.data
+  ) {
+    return res.status(422).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      item_id: itemId,
+      reason: "FAMILY_UNREADABLE",
+      error:
+        "Não foi possível consultar a família antes da escrita; nenhuma alteração foi executada",
+      family_id: familyId,
+      family_http_status:
+        familyResult.http_status,
+      before: {
+        family_name: beforeItemFamilyName
+      },
+      requested: {
+        family_name: validated.family_name
+      }
+    });
+  }
+
+  const family = familyResult.data;
+
+  const familyOwnerId =
+    family.user_id !== undefined &&
+    family.user_id !== null
+      ? String(family.user_id)
+      : "";
+
+  if (
+    !familyOwnerId ||
+    familyOwnerId !== String(session.mlUserId)
+  ) {
+    return res.status(403).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      item_id: itemId,
+      reason: "FAMILY_OWNERSHIP_MISMATCH",
+      error:
+        "A família não pertence à conta Mercado Livre autenticada; nenhuma alteração foi executada",
+      family_id: familyId,
+      family_user_id:
+        family.user_id ?? null,
+      authenticated_user_id:
+        session.mlUserId
+    });
+  }
+
+  const beforeFamilyName =
+    typeof family.family_name === "string"
+      ? family.family_name
+      : null;
+
+  /*
+   * BARREIRA 6:
+   * o valor lido no item e o valor lido
+   * diretamente na família devem coincidir.
+   */
+  if (
+    typeof beforeFamilyName !== "string" ||
+    beforeFamilyName.trim().length === 0
+  ) {
+    return res.status(422).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      item_id: itemId,
+      reason: "FAMILY_NAME_UNREADABLE",
+      error:
+        "Não foi possível validar o family_name atual diretamente na família; nenhuma alteração foi executada",
+      family_id: familyId,
+      before: {
+        item_family_name: beforeItemFamilyName,
+        family_name: beforeFamilyName
+      },
+      requested: {
+        family_name: validated.family_name
+      }
+    });
+  }
+
+  if (beforeFamilyName !== beforeItemFamilyName) {
+    return res.status(409).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      item_id: itemId,
+      reason: "FAMILY_NAME_MISMATCH",
+      error:
+        "O family_name do anúncio diverge do family_name da família; nenhuma alteração foi executada",
+      family_id: familyId,
+      before: {
+        item_family_name: beforeItemFamilyName,
+        family_name: beforeFamilyName
+      },
+      requested: {
+        family_name: validated.family_name
+      }
+    });
+  }
+
+  /*
+   * Evita escrita desnecessária.
+   */
+  if (validated.family_name === beforeFamilyName) {
+    return res.status(422).json({
+      ok: false,
+      applied: false,
+      verified: true,
+      item_id: itemId,
+      reason: "NO_CHANGE",
+      error:
+        "O family_name solicitado é idêntico ao family_name atual; nenhuma escrita foi executada",
+      family_id: familyId,
+      user_product_id: userProductId,
+      before: {
+        family_name: beforeFamilyName
+      },
+      requested: {
+        family_name: validated.family_name
+      },
+      after: {
+        family_name: beforeFamilyName
+      }
+    });
+  }
+
+  /*
+   * BARREIRA 7:
+   * enumera TODOS os User Products
+   * informados pelo recurso da família.
+   */
+  const familyUserProductsResult =
+    await requestMercadoLivre(
+      `https://api.mercadolibre.com/user-products-families/${encodeURIComponent(
+        familyId
+      )}/user-products`,
+      accessToken
+    );
+
+  if (
+    !familyUserProductsResult.ok ||
+    !familyUserProductsResult.data ||
+    !Array.isArray(
+      familyUserProductsResult.data.user_products_ids
+    )
+  ) {
+    return res.status(422).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      item_id: itemId,
+      reason: "FAMILY_USER_PRODUCTS_UNREADABLE",
+      error:
+        "Não foi possível enumerar os User Products da família; nenhuma alteração foi executada",
+      family_id: familyId,
+      family_user_products_http_status:
+        familyUserProductsResult.http_status,
+      before: {
+        family_name: beforeFamilyName
+      },
+      requested: {
+        family_name: validated.family_name
+      }
+    });
+  }
+
+  const rawFamilyUserProductIds =
+    familyUserProductsResult.data.user_products_ids;
+
+  const familyUserProductIds =
+    rawFamilyUserProductIds
+      .filter(
+        (value) =>
+          typeof value === "string" &&
+          /^MLBU\d+$/.test(value.trim())
+      )
+      .map((value) => value.trim());
+
+  /*
+   * Falha fechada se a lista estiver vazia
+   * ou contiver algum identificador inválido
+   * que tenha sido descartado.
+   */
+  if (
+    familyUserProductIds.length === 0 ||
+    familyUserProductIds.length !==
+      rawFamilyUserProductIds.length
+  ) {
+    return res.status(422).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      item_id: itemId,
+      reason: "FAMILY_USER_PRODUCTS_INVALID",
+      error:
+        "A lista de User Products da família está vazia ou contém identificadores inválidos; nenhuma alteração foi executada",
+      family_id: familyId,
+      user_products_ids:
+        familyUserProductIds,
+      before: {
+        family_name: beforeFamilyName
+      },
+      requested: {
+        family_name: validated.family_name
+      }
+    });
+  }
+
+  /*
+   * BARREIRA 8:
+   * localiza e lê todas as condições de venda
+   * de cada User Product.
+   */
+  const sellingConditions = [];
+
+  for (const relatedUserProductId of familyUserProductIds) {
+    const searchResult = await requestMercadoLivre(
+      `https://api.mercadolibre.com/users/${encodeURIComponent(
+        String(session.mlUserId)
+      )}/items/search?user_product_id=${encodeURIComponent(
+        relatedUserProductId
+      )}`,
+      accessToken
+    );
+
+    const relatedItemIds =
+      searchResult.ok &&
+      searchResult.data &&
+      Array.isArray(searchResult.data.results)
+        ? searchResult.data.results
+            .filter(
+              (value) =>
+                typeof value === "string" &&
+                /^MLB\d+$/.test(
+                  value.trim().toUpperCase()
+                )
+            )
+            .map((value) =>
+              value.trim().toUpperCase()
+            )
+        : [];
+
+    const relatedItems = [];
+
+    for (const relatedItemId of relatedItemIds) {
+      const relatedItemResult =
+        await requestMercadoLivre(
+          `https://api.mercadolibre.com/items/${encodeURIComponent(
+            relatedItemId
+          )}`,
+          accessToken
+        );
+
+      if (!relatedItemResult.ok) {
+        relatedItems.push({
+          item_id: relatedItemId,
+          status: "unavailable",
+          http_status:
+            relatedItemResult.http_status,
+          ownership_verified: false,
+          sold_quantity: null,
+          user_product_id:
+            relatedUserProductId
+        });
+        continue;
+      }
+
+      const relatedItem =
+        relatedItemResult.data;
+
+      const ownershipVerified =
+        relatedItem &&
+        relatedItem.seller_id &&
+        String(relatedItem.seller_id) ===
+          String(session.mlUserId);
+
+      if (!ownershipVerified) {
+        relatedItems.push({
+          item_id: relatedItemId,
+          status: "ownership_mismatch",
+          http_status:
+            relatedItemResult.http_status,
+          ownership_verified: false,
+          sold_quantity: null,
+          user_product_id:
+            relatedUserProductId
+        });
+        continue;
+      }
+
+      relatedItems.push({
+        item_id: relatedItemId,
+        status: "available",
+        http_status:
+          relatedItemResult.http_status,
+        ownership_verified: true,
+        sold_quantity:
+          relatedItem.sold_quantity ?? null,
+        user_product_id:
+          relatedItem.user_product_id ??
+          relatedUserProductId
+      });
+    }
+
+    sellingConditions.push({
+      user_product_id:
+        relatedUserProductId,
+      search_status: searchResult.ok
+        ? "available"
+        : "unavailable",
+      search_http_status:
+        searchResult.http_status,
+      paging:
+        searchResult.ok &&
+        searchResult.data &&
+        searchResult.data.paging
+          ? {
+              total:
+                searchResult.data.paging.total ??
+                null,
+              offset:
+                searchResult.data.paging.offset ??
+                null,
+              limit:
+                searchResult.data.paging.limit ??
+                null
+            }
+          : null,
+      item_ids: relatedItemIds,
+      items: relatedItems
+    });
+  }
+    /*
+   * BARREIRA 9:
+   * todas as condições precisam ter sido
+   * integralmente localizadas e lidas.
+   *
+   * paging.total precisa coincidir com a
+   * quantidade de item_ids retornados.
+   *
+   * User Product com zero condições é válido
+   * quando a busca foi concluída e total = 0.
+   */
+  const allSellingConditionsReadable =
+    sellingConditions.length ===
+      familyUserProductIds.length &&
+    sellingConditions.every(
+      (condition) =>
+        condition.search_status === "available" &&
+        condition.paging &&
+        Number.isFinite(
+          Number(condition.paging.total)
+        ) &&
+        Number(condition.paging.total) ===
+          condition.item_ids.length &&
+        condition.items.length ===
+          condition.item_ids.length &&
+        condition.items.every(
+          (relatedItem) =>
+            relatedItem.status === "available" &&
+            relatedItem.ownership_verified === true &&
+            Number.isFinite(
+              Number(relatedItem.sold_quantity)
+            )
+        )
+    );
+
+  if (!allSellingConditionsReadable) {
+    return res.status(422).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      item_id: itemId,
+      reason:
+        "SELLING_CONDITIONS_INCOMPLETE",
+      error:
+        "Nem todas as condições de venda da família puderam ser validadas; nenhuma alteração foi executada",
+      family_id: familyId,
+      user_product_id: userProductId,
+      selling_conditions: {
+        status: "incomplete",
+        all_readable: false,
+        all_without_sales: null,
+        user_products: sellingConditions
+      },
+      before: {
+        family_name: beforeFamilyName
+      },
+      requested: {
+        family_name: validated.family_name
+      }
+    });
+  }
+
+  /*
+   * BARREIRA 10:
+   * nenhuma condição de venda existente
+   * pode possuir vendas.
+   */
+  const allSellingConditionsWithoutSales =
+    sellingConditions.every((condition) =>
+      condition.items.every(
+        (relatedItem) =>
+          Number(relatedItem.sold_quantity) === 0
+      )
+    );
+
+  if (!allSellingConditionsWithoutSales) {
+    return res.status(422).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      item_id: itemId,
+      reason:
+        "FAMILY_HAS_SALES",
+      error:
+        "A família possui pelo menos uma condição de venda com vendas; nenhuma alteração de family_name foi executada",
+      family_id: familyId,
+      user_product_id: userProductId,
+      selling_conditions: {
+        status: "available",
+        all_readable: true,
+        all_without_sales: false,
+        user_products: sellingConditions
+      },
+      before: {
+        family_name: beforeFamilyName
+      },
+      requested: {
+        family_name: validated.family_name
+      }
+    });
+  }
+
+  /*
+   * BARREIRA 11:
+   * PAYLOAD MÍNIMO E ISOLADO.
+   *
+   * O Mercado Livre recebe EXCLUSIVAMENTE:
+   * family_name
+   *
+   * NÃO entram:
+   * item_id
+   * title
+   * SKU / SELLER_SKU
+   * atributos
+   * descrição
+   * categoria
+   * domain_id
+   * preço
+   * estoque
+   * imagens
+   * variações
+   * qualquer outro campo
+   */
+  const updateBody = {
+    family_name: validated.family_name
+  };
+
+  const updateResult = await requestMercadoLivre(
+    `https://api.mercadolibre.com/user-products-families/${encodeURIComponent(
+      familyId
+    )}`,
+    accessToken,
+    "PUT",
+    updateBody
+  );
+
+  /*
+   * Não há retry alternativo.
+   * Não há tentativa via /items.
+   * Não contornamos rejeições do Mercado Livre.
+   */
+  if (!updateResult.ok) {
+    return res.status(
+      updateResult.http_status || 502
+    ).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      item_id: itemId,
+      reason:
+        "MERCADO_LIVRE_REJECTED_FAMILY_UPDATE",
+      error:
+        "Mercado Livre recusou a atualização de family_name",
+      mercado_livre_status:
+        updateResult.http_status,
+      mercado_livre_response:
+        updateResult.data,
+      family_id: familyId,
+      user_product_id: userProductId,
+      selling_conditions: {
+        status: "available",
+        all_readable: true,
+        all_without_sales: true,
+        user_products: sellingConditions
+      },
+      before: {
+        family_name: beforeFamilyName
+      },
+      requested: {
+        family_name: validated.family_name
+      }
+    });
+  }
+
+  /*
+   * BARREIRA 12:
+   * reconsulta obrigatória da própria família.
+   *
+   * A verificação principal é feita no recurso
+   * que acabou de ser atualizado.
+   */
+  const afterFamilyResult =
+    await requestMercadoLivre(
+      `https://api.mercadolibre.com/user-products-families/${encodeURIComponent(
+        familyId
+      )}`,
+      accessToken
+    );
+
+  if (
+    !afterFamilyResult.ok ||
+    !afterFamilyResult.data
+  ) {
+    return res.status(200).json({
+      ok: true,
+      applied: true,
+      verified: false,
+      item_id: itemId,
+      family_id: familyId,
+      user_product_id: userProductId,
+      selling_conditions: {
+        status: "available",
+        all_readable: true,
+        all_without_sales: true,
+        user_products: sellingConditions
+      },
+      before: {
+        family_name: beforeFamilyName
+      },
+      requested: {
+        family_name: validated.family_name
+      },
+      error:
+        "A atualização de family_name foi aceita pelo Mercado Livre, mas a verificação posterior da família falhou",
+      verification_http_status:
+        afterFamilyResult.http_status,
+      mercado_livre_response:
+        updateResult.data
+    });
+  }
+
+  const afterFamilyName =
+    typeof afterFamilyResult.data.family_name ===
+    "string"
+      ? afterFamilyResult.data.family_name
+      : null;
+
+  const verified =
+    afterFamilyName === validated.family_name;
+
+  /*
+   * Consulta adicional do anúncio de referência.
+   *
+   * Esta leitura NÃO determina o sucesso da
+   * atualização da família, pois a propagação
+   * aos User Products/itens pode ocorrer depois.
+   */
+  const afterItemResult =
+    await requestMercadoLivre(
+      `https://api.mercadolibre.com/items/${encodeURIComponent(
+        itemId
+      )}`,
+      accessToken
+    );
+
+  const afterItemFamilyName =
+    afterItemResult.ok &&
+    afterItemResult.data &&
+    typeof afterItemResult.data.family_name ===
+      "string"
+      ? afterItemResult.data.family_name
+      : null;
+
+  const afterItemTitle =
+    afterItemResult.ok &&
+    afterItemResult.data &&
+    typeof afterItemResult.data.title === "string"
+      ? afterItemResult.data.title
+      : null;
+
+  const propagationObserved =
+    afterItemResult.ok &&
+    afterItemFamilyName ===
+      validated.family_name;
+
+  return res.status(200).json({
+    ok: true,
+    applied: true,
+    verified,
+    item_id: itemId,
+    family_id: familyId,
+    user_product_id: userProductId,
+
+    selling_conditions: {
+      status: "available",
+      all_readable: true,
+      all_without_sales: true,
+      user_products: sellingConditions
+    },
+
+    before: {
+      family_name: beforeFamilyName
+    },
+
+    requested: {
+      family_name: validated.family_name
+    },
+
+    after: {
+      family_name: afterFamilyName
+    },
+
+    changes: [
+      {
+        field: "family_name",
+        before: beforeFamilyName,
+        requested: validated.family_name,
+        after: afterFamilyName,
+        verified
+      }
+    ],
+
+    propagation: {
+      status: propagationObserved
+        ? "observed"
+        : "pending_or_not_observed",
+      item_http_status:
+        afterItemResult.http_status,
+      item_family_name:
+        afterItemFamilyName,
+      item_title:
+        afterItemTitle
+    },
+
+    mercado_livre_response:
+      updateResult.data
+  });
+}
+
 export default async function handler(req, res) {
   res.setHeader(
     "Cache-Control",
@@ -1158,18 +2098,29 @@ export default async function handler(req, res) {
       return await handlePatch(req, res);
     }
 
+    /*
+     * PUT fica reservado neste endpoint
+     * exclusivamente ao fluxo protegido
+     * de atualização de family_name.
+     */
+    if (req.method === "PUT") {
+      return await handlePutFamilyName(req, res);
+    }
+
     res.setHeader(
       "Allow",
-      "GET, POST, PATCH"
+      "GET, POST, PATCH, PUT"
     );
 
     return res.status(405).json({
       ok: false,
+      applied: false,
+      verified: false,
       error: "Método não permitido"
     });
   } catch (error) {
     console.error(
-      "Erro no endpoint de anúncio/descrição/título:",
+      "Erro no endpoint de anúncio/descrição/título/família:",
       error instanceof Error
         ? error.message
         : "erro desconhecido"
@@ -1180,7 +2131,7 @@ export default async function handler(req, res) {
       applied: false,
       verified: false,
       error:
-        "Erro interno no endpoint de anúncio/descrição/título"
+        "Erro interno no endpoint de anúncio/descrição/título/família"
     });
   }
 }
