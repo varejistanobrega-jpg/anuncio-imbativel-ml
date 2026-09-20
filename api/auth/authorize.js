@@ -9,12 +9,21 @@ function isAllowedRedirectUri(value) {
   try {
     const url = new URL(value);
 
+    const allowedHost =
+      url.hostname === "chatgpt.com" ||
+      url.hostname === "chat.openai.com";
+
+    const allowedPath =
+      /^\/aip\/g-[A-Za-z0-9_-]+\/oauth\/callback$/.test(url.pathname);
+
     return (
       url.protocol === "https:" &&
-      (
-        url.hostname === "chatgpt.com" ||
-        url.hostname === "chat.openai.com"
-      )
+      allowedHost &&
+      allowedPath &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash
     );
   } catch {
     return false;
