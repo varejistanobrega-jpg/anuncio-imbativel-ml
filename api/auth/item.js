@@ -296,6 +296,160 @@ async function handleGet(req, res) {
             .map((value) => value.trim())
         : [];
 
+    /*
+     * CONDIÇÕES DE VENDA DA FAMÍLIA
+     *
+     * Para cada User Product da família:
+     * 1. localiza os item_ids pertencentes ao seller autenticado;
+     * 2. consulta cada item individualmente;
+     * 3. valida novamente a propriedade;
+     * 4. retorna sold_quantity e dados mínimos para auditoria.
+     *
+     * Somente leitura. Nenhum PUT/POST/PATCH é executado aqui.
+     */
+    const sellingConditions = [];
+
+    for (const relatedUserProductId of familyUserProductIds) {
+      const searchResult = await requestMercadoLivre(
+        `https://api.mercadolibre.com/users/${encodeURIComponent(
+          String(item.seller_id)
+        )}/items/search?user_product_id=${encodeURIComponent(
+          relatedUserProductId
+        )}`,
+        accessToken
+      );
+
+      const relatedItemIds =
+        searchResult.ok &&
+        searchResult.data &&
+        Array.isArray(searchResult.data.results)
+          ? searchResult.data.results
+              .filter(
+                (value) =>
+                  typeof value === "string" &&
+                  /^MLB\d+$/.test(value.trim().toUpperCase())
+              )
+              .map((value) => value.trim().toUpperCase())
+          : [];
+
+      const relatedItems = [];
+
+      for (const relatedItemId of relatedItemIds) {
+        const relatedItemResult = await requestMercadoLivre(
+          `https://api.mercadolibre.com/items/${encodeURIComponent(
+            relatedItemId
+          )}`,
+          accessToken
+        );
+
+        if (!relatedItemResult.ok) {
+          relatedItems.push({
+            item_id: relatedItemId,
+            status: "unavailable",
+            http_status: relatedItemResult.http_status,
+            ownership_verified: false,
+            title: null,
+            item_status: null,
+            sold_quantity: null,
+            user_product_id: relatedUserProductId
+          });
+          continue;
+        }
+
+        const relatedItem = relatedItemResult.data;
+
+        const ownershipVerified =
+          relatedItem &&
+          relatedItem.seller_id &&
+          String(relatedItem.seller_id) ===
+            String(item.seller_id);
+
+        if (!ownershipVerified) {
+          relatedItems.push({
+            item_id: relatedItemId,
+            status: "ownership_mismatch",
+            http_status: relatedItemResult.http_status,
+            ownership_verified: false,
+            title: null,
+            item_status: null,
+            sold_quantity: null,
+            user_product_id: relatedUserProductId
+          });
+          continue;
+        }
+
+        relatedItems.push({
+          item_id: relatedItemId,
+          status: "available",
+          http_status: relatedItemResult.http_status,
+          ownership_verified: true,
+          title:
+            typeof relatedItem.title === "string"
+              ? relatedItem.title
+              : null,
+          item_status: relatedItem.status ?? null,
+          sold_quantity: relatedItem.sold_quantity ?? null,
+          user_product_id:
+            relatedItem.user_product_id ??
+            relatedUserProductId
+        });
+      }
+
+      sellingConditions.push({
+        user_product_id: relatedUserProductId,
+        search_status: searchResult.ok
+                  ? "available"
+          : "unavailable",
+        search_http_status: searchResult.http_status,
+        paging:
+          searchResult.ok &&
+          searchResult.data &&
+          searchResult.data.paging
+            ? {
+                total:
+                  searchResult.data.paging.total ?? null,
+                offset:
+                  searchResult.data.paging.offset ?? null,
+                limit:
+                  searchResult.data.paging.limit ?? null
+              }
+            : null,
+        item_ids: relatedItemIds,
+        items: relatedItems
+      });
+    }
+
+    const allSellingConditionsReadable =
+      familyUserProductIds.length > 0 &&
+      sellingConditions.length === familyUserProductIds.length &&
+      sellingConditions.every(
+        (condition) =>
+          condition.search_status === "available" &&
+          condition.paging &&
+          Number.isFinite(Number(condition.paging.total)) &&
+          Number(condition.paging.total) ===
+            condition.item_ids.length &&
+          condition.items.length ===
+            condition.item_ids.length &&
+          condition.items.every(
+            (relatedItem) =>
+              relatedItem.status === "available" &&
+              relatedItem.ownership_verified === true &&
+              Number.isFinite(
+                Number(relatedItem.sold_quantity)
+              )
+          )
+      );
+
+    const allSellingConditionsWithoutSales =
+      allSellingConditionsReadable &&
+      sellingConditions.every((condition) =>
+        condition.items.every(
+          (relatedItem) =>
+            Number(relatedItem.sold_quantity) === 0
+        )
+      );
+
     return res.status(200).json({
       ok: true,
       view: "user_product",
@@ -337,6 +491,18 @@ async function handleGet(req, res) {
           familyUserProductsResult.http_status,
         family_id: effectiveFamilyId || null,
         user_products_ids: familyUserProductIds
+      },
+
+      selling_conditions: {
+        status: allSellingConditionsReadable
+          ? "available"
+          : "incomplete",
+        all_readable: allSellingConditionsReadable,
+        all_without_sales:
+          allSellingConditionsReadable
+            ? allSellingConditionsWithoutSales
+            : null,
+        user_products: sellingConditions
       }
     });
   }
@@ -812,8 +978,7 @@ async function handlePatch(req, res) {
       }
     });
   }
-
-  /*
+    /*
    * BARREIRA 4:
    * fluxo de título direto somente para
    * anúncio sem vendas.
