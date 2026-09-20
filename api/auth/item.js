@@ -6,6 +6,13 @@ const DESCRIPTION_ALLOWED_BODY_KEYS = new Set([
   "plain_text"
 ]);
 
+const TITLE_ALLOWED_BODY_KEYS = new Set([
+  "item_id",
+  "title"
+]);
+
+const MAX_TITLE_LENGTH = 60;
+
 function normalizeItemId(value) {
   return String(value || "")
     .trim()
@@ -619,6 +626,276 @@ async function handlePost(req, res) {
   });
 }
 
+function validateTitleBody(body) {
+  if (
+    !body ||
+    typeof body !== "object" ||
+    Array.isArray(body)
+  ) {
+    throw new Error(
+      "Corpo da solicitação inválido"
+    );
+  }
+
+  /*
+   * Allowlist absoluta:
+   * este fluxo aceita SOMENTE item_id e title.
+   */
+  const receivedKeys = Object.keys(body);
+
+  const forbiddenKeys = receivedKeys.filter(
+    (key) =>
+      !TITLE_ALLOWED_BODY_KEYS.has(key)
+  );
+
+  if (forbiddenKeys.length > 0) {
+    throw new Error(
+      `Campos não autorizados na atualização de título: ${forbiddenKeys.join(
+        ", "
+      )}`
+    );
+  }
+
+  const itemId = normalizeItemId(
+    body.item_id
+  );
+
+  if (!/^MLB\d+$/.test(itemId)) {
+    throw new Error("item_id inválido");
+  }
+
+  if (typeof body.title !== "string") {
+    throw new Error(
+      "title deve ser uma string"
+    );
+  }
+
+  /*
+   * Não modificamos silenciosamente o título.
+   * O valor enviado será exatamente o aprovado.
+   */
+  if (body.title.trim().length === 0) {
+    throw new Error(
+      "O título não pode estar vazio"
+    );
+  }
+
+  if (body.title.length > MAX_TITLE_LENGTH) {
+    throw new Error(
+      `O título não pode ultrapassar ${MAX_TITLE_LENGTH} caracteres`
+    );
+  }
+
+  return {
+    item_id: itemId,
+    title: body.title
+  };
+}
+
+async function handlePatch(req, res) {
+  let validated;
+
+  /*
+   * BARREIRA 1:
+   * estrutura e allowlist antes de carregar o anúncio.
+   */
+  try {
+    validated = validateTitleBody(
+      req.body
+    );
+  } catch (error) {
+    return res.status(400).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Solicitação inválida"
+    });
+  }
+
+  /*
+   * BARREIRA 2:
+   * autenticação + propriedade.
+   */
+  const loaded = await authenticateAndLoadItem(
+    req,
+    validated.item_id
+  );
+
+  if (loaded.error) {
+    return res
+      .status(loaded.error.status)
+      .json(loaded.error.body);
+  }
+
+  const {
+    accessToken,
+    itemId,
+    item
+  } = loaded;
+
+  const beforeTitle =
+    typeof item.title === "string"
+      ? item.title
+      : null;
+
+  const soldQuantity =
+    Number(item.sold_quantity);
+
+  /*
+   * BARREIRA 3:
+   * título só é elegível neste fluxo quando
+   * o anúncio não possui vendas.
+   *
+   * Falhamos de forma fechada se sold_quantity
+   * estiver ausente, inválido ou for diferente de 0.
+   */
+  if (
+    !Number.isFinite(soldQuantity) ||
+    soldQuantity !== 0
+  ) {
+    return res.status(422).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      item_id: itemId,
+      error:
+        "O título não pode ser alterado por este fluxo porque o anúncio possui vendas ou a quantidade vendida não pôde ser validada como zero",
+      sold_quantity:
+        item.sold_quantity ?? null,
+      before: {
+        title: beforeTitle
+      },
+      requested: {
+        title: validated.title
+      }
+    });
+  }
+
+  /*
+   * PAYLOAD MÍNIMO E ISOLADO.
+   *
+   * O Mercado Livre recebe SOMENTE title.
+   * SKU/SELLER_SKU, preço, estoque, atributos,
+   * imagens, categoria e demais campos não entram.
+   */
+  const updateBody = {
+    title: validated.title
+  };
+
+  /*
+   * Atualização do item.
+   *
+   * Não tentamos contornar estados, moderações
+   * ou restrições retornadas pelo Mercado Livre.
+   */
+  const updateResult =
+    await requestMercadoLivre(
+      `https://api.mercadolibre.com/items/${encodeURIComponent(
+        itemId
+      )}`,
+      accessToken,
+      "PUT",
+      updateBody
+    );
+
+  if (!updateResult.ok) {
+    return res.status(
+      updateResult.http_status || 502
+    ).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      item_id: itemId,
+      error:
+        "Mercado Livre recusou a atualização do título",
+      mercado_livre_status:
+        updateResult.http_status,
+      mercado_livre_response:
+        updateResult.data,
+      before: {
+        title: beforeTitle
+      },
+      requested: {
+        title: validated.title
+      }
+    });
+  }
+
+  /*
+   * BARREIRA 4:
+   * reconsulta obrigatória após o PUT.
+   */
+  const afterResult =
+    await requestMercadoLivre(
+      `https://api.mercadolibre.com/items/${encodeURIComponent(
+        itemId
+      )}`,
+      accessToken
+    );
+
+  if (!afterResult.ok) {
+    return res.status(200).json({
+      ok: true,
+      applied: true,
+      verified: false,
+      item_id: itemId,
+      before: {
+        title: beforeTitle
+      },
+      requested: {
+        title: validated.title
+      },
+      error:
+        "A atualização do título foi aceita, mas a verificação posterior falhou",
+      verification_http_status:
+        afterResult.http_status
+    });
+  }
+
+  const afterTitle =
+    afterResult.data &&
+    typeof afterResult.data.title === "string"
+      ? afterResult.data.title
+      : null;
+
+  /*
+   * Comparação literal:
+   * só marcamos verified=true se o título
+   * reconsultado for exatamente o solicitado.
+   */
+  const verified =
+    afterTitle === validated.title;
+
+  return res.status(200).json({
+    ok: true,
+    applied: true,
+    verified,
+    item_id: itemId,
+    sold_quantity: soldQuantity,
+    before: {
+      title: beforeTitle
+    },
+    requested: {
+      title: validated.title
+    },
+    after: {
+      title: afterTitle
+    },
+    changes: [
+      {
+        field: "title",
+        before: beforeTitle,
+        requested: validated.title,
+        after: afterTitle,
+        verified
+      }
+    ]
+  });
+}
+
 export default async function handler(req, res) {
   res.setHeader(
     "Cache-Control",
@@ -634,9 +911,13 @@ export default async function handler(req, res) {
       return await handlePost(req, res);
     }
 
+    if (req.method === "PATCH") {
+      return await handlePatch(req, res);
+    }
+
     res.setHeader(
       "Allow",
-      "GET, POST"
+      "GET, POST, PATCH"
     );
 
     return res.status(405).json({
@@ -645,7 +926,7 @@ export default async function handler(req, res) {
     });
   } catch (error) {
     console.error(
-      "Erro no endpoint de anúncio/descrição:",
+      "Erro no endpoint de anúncio/descrição/título:",
       error instanceof Error
         ? error.message
         : "erro desconhecido"
@@ -656,7 +937,7 @@ export default async function handler(req, res) {
       applied: false,
       verified: false,
       error:
-        "Erro interno no endpoint de anúncio/descrição"
+        "Erro interno no endpoint de anúncio/descrição/título"
     });
   }
 }
