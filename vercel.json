@@ -3,6 +3,10 @@
     {
       "source": "/api/auth/seller-items",
       "destination": "/api/auth/items?mode=seller_items"
+    },
+    {
+      "source": "/api/auth/user-product",
+      "destination": "/api/auth/item?view=user_product"
     }
   ]
 }
