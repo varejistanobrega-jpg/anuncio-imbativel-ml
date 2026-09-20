@@ -3,24 +3,37 @@ import { getValidMeliAccessToken } from "../../lib/meli-token.js";
 
 /*
  * Identificadores absolutamente protegidos.
- * Eles nunca podem participar de uma operação de escrita.
+ * Nunca podem participar de uma operação de escrita.
  */
-const PROTECTED_ATTRIBUTE_IDS = new Set([
+const ABSOLUTELY_PROTECTED_ATTRIBUTE_IDS = new Set([
   "SELLER_SKU"
 ]);
 
 /*
- * Atributos que não queremos permitir nesta primeira
- * versão controlada da escrita.
+ * Identificadores de produto que ficam fora desta
+ * primeira superfície genérica de escrita.
+ *
+ * Terão tratamento específico futuramente.
  */
-const BLOCKED_ATTRIBUTE_IDS = new Set([
-  "GTIN"
+const TEMPORARILY_BLOCKED_ATTRIBUTE_IDS = new Set([
+  "GTIN",
+  "EAN",
+  "UPC",
+  "JAN"
 ]);
 
 function normalizeId(value) {
   return String(value || "")
     .trim()
     .toUpperCase();
+}
+
+function hasTrueTag(tags, tagName) {
+  if (!tags || typeof tags !== "object") {
+    return false;
+  }
+
+  return tags[tagName] === true;
 }
 
 async function requestMercadoLivre(
@@ -60,11 +73,10 @@ async function requestMercadoLivre(
 }
 
 /*
- * Defesa profunda contra SKU.
+ * Defesa profunda.
  *
- * Mesmo que no futuro o Schema mude ou algum cliente tente
- * enviar SELLER_SKU em uma estrutura inesperada, a requisição
- * é recusada antes de qualquer PUT no Mercado Livre.
+ * SELLER_SKU não pode aparecer em nenhuma estrutura
+ * recebida para escrita.
  */
 function containsProtectedSkuDeep(value) {
   if (value === null || value === undefined) {
@@ -128,15 +140,15 @@ function sanitizeRequestedAttributes(attributes) {
       throw new Error("Atributo sem id");
     }
 
-    if (PROTECTED_ATTRIBUTE_IDS.has(id)) {
+    if (ABSOLUTELY_PROTECTED_ATTRIBUTE_IDS.has(id)) {
       throw new Error(
         "SKU é um identificador protegido e imutável"
       );
     }
 
-    if (BLOCKED_ATTRIBUTE_IDS.has(id)) {
+    if (TEMPORARILY_BLOCKED_ATTRIBUTE_IDS.has(id)) {
       throw new Error(
-        `O atributo ${id} não está autorizado nesta versão da escrita`
+        `O atributo ${id} exige fluxo específico e não está autorizado nesta operação`
       );
     }
 
@@ -199,6 +211,8 @@ async function authenticateAndLoadItem(req, itemId) {
         status: 401,
         body: {
           ok: false,
+          applied: false,
+          verified: false,
           error: "Sessão não autenticada ou expirada"
         }
       }
@@ -213,6 +227,8 @@ async function authenticateAndLoadItem(req, itemId) {
         status: 400,
         body: {
           ok: false,
+          applied: false,
+          verified: false,
           error: "item_id inválido"
         }
       }
@@ -236,6 +252,8 @@ async function authenticateAndLoadItem(req, itemId) {
         status: itemResult.status || 502,
         body: {
           ok: false,
+          applied: false,
+          verified: false,
           error:
             "Mercado Livre recusou a consulta do anúncio",
           mercado_livre_status: itemResult.status,
@@ -248,8 +266,10 @@ async function authenticateAndLoadItem(req, itemId) {
   const item = itemResult.data;
 
   /*
-   * Proteção multi-vendedor:
-   * nunca confiar em seller_id recebido do GPT.
+   * Proteção multi-vendedor.
+   *
+   * O seller_id usado aqui vem do próprio Mercado Livre,
+   * nunca do corpo enviado pelo GPT.
    */
   if (
     !item ||
@@ -262,6 +282,8 @@ async function authenticateAndLoadItem(req, itemId) {
         status: 403,
         body: {
           ok: false,
+          applied: false,
+          verified: false,
           error:
             "O anúncio não pertence à conta Mercado Livre autenticada"
         }
@@ -279,6 +301,8 @@ async function authenticateAndLoadItem(req, itemId) {
         status: 422,
         body: {
           ok: false,
+          applied: false,
+          verified: false,
           error:
             "O anúncio não possui categoria válida"
         }
@@ -307,6 +331,164 @@ function findItemAttribute(item, attributeId) {
         normalizeId(attributeId)
     ) || null
   );
+}
+
+function getDefinitionValues(definition) {
+  return Array.isArray(definition?.values)
+    ? definition.values
+    : [];
+}
+
+function validateRequestedAttribute(
+  requested,
+  definition,
+  item
+) {
+  const tags =
+    definition?.tags &&
+    typeof definition.tags === "object"
+      ? definition.tags
+      : {};
+
+  /*
+   * Campos que o vendedor não deve modificar.
+   */
+  if (
+    hasTrueTag(tags, "read_only") ||
+    hasTrueTag(tags, "readonly")
+  ) {
+    throw new Error(
+      `O atributo ${requested.id} é somente leitura`
+    );
+  }
+
+  if (hasTrueTag(tags, "fixed")) {
+    throw new Error(
+      `O atributo ${requested.id} possui valor fixo`
+    );
+  }
+
+  if (hasTrueTag(tags, "inferred")) {
+    throw new Error(
+      `O atributo ${requested.id} possui valor inferido e não pode ser alterado`
+    );
+  }
+
+  /*
+   * Esta Action modifica atributos no nível do item.
+   *
+   * Se o anúncio possui variações, atributos marcados como
+   * variation_attribute ficam fora deste endpoint genérico.
+   * Futuramente terão fluxo próprio por variação.
+   *
+   * Se NÃO existem variações, a tag por si só não bloqueia
+   * o atributo.
+   */
+  const variations = Array.isArray(item?.variations)
+    ? item.variations
+    : [];
+
+  if (
+    variations.length > 0 &&
+    hasTrueTag(tags, "variation_attribute")
+  ) {
+    throw new Error(
+      `O atributo ${requested.id} exige tratamento específico por variação neste anúncio`
+    );
+  }
+
+  const valueType = String(
+    definition?.value_type || ""
+  )
+    .trim()
+    .toLowerCase();
+
+  const definitionValues =
+    getDefinitionValues(definition);
+
+  /*
+   * BOOLEAN
+   *
+   * A API exige o ID do valor.
+   */
+  if (valueType === "boolean") {
+    if (!requested.value_id) {
+      throw new Error(
+        `O atributo booleano ${requested.id} exige value_id`
+      );
+    }
+
+    if (definitionValues.length > 0) {
+      const allowed = definitionValues.some(
+        (value) =>
+          String(value?.id) ===
+          String(requested.value_id)
+      );
+
+      if (!allowed) {
+        throw new Error(
+          `value_id inválido para o atributo ${requested.id}`
+        );
+      }
+    }
+  }
+
+  /*
+   * LIST
+   *
+   * Quando o cliente envia value_id, esse ID precisa
+   * existir entre os valores apresentados pela categoria.
+   *
+   * value_name continua permitido porque existem fluxos
+   * do Mercado Livre em que o nome pode ser informado.
+   */
+  if (
+    valueType === "list" &&
+    requested.value_id &&
+    definitionValues.length > 0
+  ) {
+    const allowed = definitionValues.some(
+      (value) =>
+        String(value?.id) ===
+        String(requested.value_id)
+    );
+
+    if (!allowed) {
+      throw new Error(
+        `value_id inválido para o atributo ${requested.id}`
+      );
+    }
+  }
+
+  /*
+   * Limite máximo de caracteres definido pela categoria.
+   */
+  const maxLength = Number(
+    definition?.value_max_length
+  );
+
+  if (
+    Number.isFinite(maxLength) &&
+    maxLength > 0
+  ) {
+    if (
+      requested.value_name &&
+      requested.value_name.length > maxLength
+    ) {
+      throw new Error(
+        `value_name excede o limite de ${maxLength} caracteres para ${requested.id}`
+      );
+    }
+
+    if (
+      requested.value_id &&
+      requested.value_id.length > maxLength
+    ) {
+      throw new Error(
+        `value_id excede o limite de ${maxLength} caracteres para ${requested.id}`
+      );
+    }
+  }
 }
 
 async function handleGet(req, res) {
@@ -360,8 +542,8 @@ async function handleGet(req, res) {
 
 async function handlePost(req, res) {
   /*
-   * PRIMEIRA BARREIRA:
-   * SKU não pode aparecer em nenhuma parte da solicitação.
+   * BARREIRA 1:
+   * rejeita SKU antes até mesmo de carregar o anúncio.
    */
   if (containsProtectedSkuDeep(req.body)) {
     return res.status(400).json({
@@ -411,8 +593,7 @@ async function handlePost(req, res) {
   } = loaded;
 
   /*
-   * Consulta a definição oficial dos atributos
-   * da categoria antes da escrita.
+   * Carrega a definição atual dos atributos da categoria.
    */
   const categoryAttributesResult =
     await requestMercadoLivre(
@@ -447,59 +628,61 @@ async function handlePost(req, res) {
   );
 
   /*
-   * Valida individualmente tudo o que será escrito.
+   * Validação completa antes de qualquer PUT.
    */
-  for (const requested of requestedAttributes) {
-    const definition =
-      categoryAttributeMap.get(requested.id);
+  try {
+    for (const requested of requestedAttributes) {
+      const definition =
+        categoryAttributeMap.get(requested.id);
 
-    if (!definition) {
-      return res.status(400).json({
-        ok: false,
-        applied: false,
-        verified: false,
-        error:
+      if (!definition) {
+        throw new Error(
           `O atributo ${requested.id} não pertence à categoria ${categoryId}`
-      });
-    }
+        );
+      }
 
-    if (
-      PROTECTED_ATTRIBUTE_IDS.has(
-        requested.id
-      )
-    ) {
-      return res.status(400).json({
-        ok: false,
-        applied: false,
-        verified: false,
-        error:
+      if (
+        ABSOLUTELY_PROTECTED_ATTRIBUTE_IDS.has(
+          requested.id
+        )
+      ) {
+        throw new Error(
           "SKU é um identificador protegido e imutável"
-      });
-    }
+        );
+      }
 
-    const tags =
-      definition.tags &&
-      typeof definition.tags === "object"
-        ? definition.tags
-        : {};
+      if (
+        TEMPORARILY_BLOCKED_ATTRIBUTE_IDS.has(
+          requested.id
+        )
+      ) {
+        throw new Error(
+          `O atributo ${requested.id} exige fluxo específico e não está autorizado nesta operação`
+        );
+      }
 
-    if (
-      tags.fixed === true ||
-      tags.read_only === true ||
-      tags.readonly === true
-    ) {
-      return res.status(400).json({
-        ok: false,
-        applied: false,
-        verified: false,
-        error:
-          `O atributo ${requested.id} não pode ser alterado por esta operação`
-      });
+      validateRequestedAttribute(
+        requested,
+        definition,
+        itemBefore
+      );
     }
+  } catch (error) {
+    return res.status(400).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      item_id: itemId,
+      category_id: categoryId,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Atributo não autorizado"
+    });
   }
 
   /*
-   * Snapshot somente dos atributos solicitados.
+   * Snapshot dos campos que realmente serão modificados.
    */
   const before = requestedAttributes.map(
     (requested) => ({
@@ -515,23 +698,24 @@ async function handlePost(req, res) {
   /*
    * PAYLOAD MÍNIMO.
    *
-   * Nenhum atributo atual é copiado.
-   * SELLER_SKU não entra no payload.
-   * Nenhum preço, estoque, título, descrição,
-   * imagem, categoria ou outro campo é enviado.
+   * Somente os atributos solicitados entram no PUT.
+   * SELLER_SKU nunca é copiado do anúncio.
    */
   const updateBody = {
     attributes: requestedAttributes
   };
 
   /*
-   * ÚLTIMA BARREIRA antes do PUT.
+   * BARREIRA 2:
+   * inspeção final do payload imediatamente antes do PUT.
    */
   if (containsProtectedSkuDeep(updateBody)) {
     return res.status(400).json({
       ok: false,
       applied: false,
       verified: false,
+      item_id: itemId,
+      category_id: categoryId,
       error:
         "Operação cancelada: SKU detectado no payload de escrita"
     });
@@ -568,8 +752,8 @@ async function handlePost(req, res) {
   }
 
   /*
-   * Nunca considerar o PUT suficiente.
-   * Fazemos uma nova leitura do anúncio.
+   * Nunca considerar somente a resposta do PUT
+   * como prova suficiente.
    */
   const verifyResult =
     await requestMercadoLivre(
