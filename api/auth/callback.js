@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import { neon } from "@neondatabase/serverless";
 
 function getCookie(req, name) {
@@ -11,6 +12,45 @@ function getCookie(req, name) {
   return cookie
     ? decodeURIComponent(cookie.substring(name.length + 1))
     : null;
+}
+
+function getEncryptionKey() {
+  const keyHex = process.env.TOKEN_ENCRYPTION_KEY;
+
+  if (!keyHex || !/^[0-9a-fA-F]{64}$/.test(keyHex)) {
+    throw new Error("TOKEN_ENCRYPTION_KEY inválida");
+  }
+
+  return Buffer.from(keyHex, "hex");
+}
+
+function encryptToken(token) {
+  const key = getEncryptionKey();
+
+  // 12 bytes é o tamanho recomendado de nonce/IV para GCM.
+  const iv = crypto.randomBytes(12);
+
+  const cipher = crypto.createCipheriv(
+    "aes-256-gcm",
+    key,
+    iv
+  );
+
+  const encrypted = Buffer.concat([
+    cipher.update(token, "utf8"),
+    cipher.final()
+  ]);
+
+  const authTag = cipher.getAuthTag();
+
+  // Envelope versionado para permitir mudanças futuras
+  // sem perder compatibilidade com tokens já armazenados.
+  return [
+    "v1",
+    iv.toString("base64"),
+    authTag.toString("base64"),
+    encrypted.toString("base64")
+  ].join(":");
 }
 
 export default async function handler(req, res) {
@@ -43,10 +83,7 @@ export default async function handler(req, res) {
     const clientId = process.env.MELI_CLIENT_ID;
     const clientSecret = process.env.MELI_CLIENT_SECRET;
     const redirectUri = process.env.MELI_REDIRECT_URI;
-    const databaseUrl =
-      process.env.DATABASE_URL ||
-      process.env.STORAGE_URL ||
-      process.env.POSTGRES_URL;
+    const databaseUrl = process.env.DATABASE_URL;
 
     if (!clientId || !clientSecret || !redirectUri) {
       return res.status(500).json({
@@ -62,6 +99,9 @@ export default async function handler(req, res) {
       });
     }
 
+    // Valida a chave antes de solicitar tokens ao Mercado Livre.
+    getEncryptionKey();
+
     const body = new URLSearchParams({
       grant_type: "authorization_code",
       client_id: clientId,
@@ -75,7 +115,7 @@ export default async function handler(req, res) {
       {
         method: "POST",
         headers: {
-          "Accept": "application/json",
+          Accept: "application/json",
           "Content-Type": "application/x-www-form-urlencoded"
         },
         body
@@ -107,13 +147,25 @@ export default async function handler(req, res) {
       });
     }
 
-    const sql = neon(databaseUrl);
+    // Criptografa antes de qualquer gravação no banco.
+    const encryptedAccessToken =
+      encryptToken(tokenData.access_token);
+
+    const encryptedRefreshToken =
+      encryptToken(tokenData.refresh_token);
 
     const expiresIn = Number(tokenData.expires_in || 0);
 
-    const tokenExpiresAt = new Date(
-      Date.now() + expiresIn * 1000
-    );
+    const tokenExpiresAt =
+      expiresIn > 0
+        ? new Date(Date.now() + expiresIn * 1000)
+        : null;
+
+    const scope = Array.isArray(tokenData.scope)
+      ? tokenData.scope.join(" ")
+      : tokenData.scope || null;
+
+    const sql = neon(databaseUrl);
 
     await sql`
       INSERT INTO mercado_livre_accounts (
@@ -127,10 +179,10 @@ export default async function handler(req, res) {
       )
       VALUES (
         ${String(tokenData.user_id)},
-        ${tokenData.access_token},
-        ${tokenData.refresh_token},
+        ${encryptedAccessToken},
+        ${encryptedRefreshToken},
         ${tokenExpiresAt},
-        ${tokenData.scope || null},
+        ${scope},
         ${tokenData.token_type || null},
         NOW()
       )
@@ -146,11 +198,14 @@ export default async function handler(req, res) {
 
     return res.status(200).json({
       ok: true,
-      message: "Conta Mercado Livre autorizada e armazenada com sucesso",
+      message: "Conta Mercado Livre autorizada e armazenada com segurança",
       user_id: tokenData.user_id
     });
   } catch (error) {
-    console.error("Erro no callback OAuth:", error);
+    console.error(
+      "Erro no callback OAuth:",
+      error instanceof Error ? error.message : "erro desconhecido"
+    );
 
     return res.status(500).json({
       ok: false,
