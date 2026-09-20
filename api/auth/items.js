@@ -1,96 +1,156 @@
-import { neon } from "@neondatabase/serverless";
-import { decryptToken } from "./crypto.js";
+import { getAuthenticatedSession } from "./session.js";
+import { getValidMeliAccessToken } from "../../lib/meli-token.js";
+
+async function getResource(url, accessToken) {
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${accessToken}`
+    }
+  });
+
+  let data = null;
+
+  try {
+    data = await response.json();
+  } catch {
+    data = null;
+  }
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    data
+  };
+}
 
 export default async function handler(req, res) {
   try {
-    const userId = String(req.query.user_id || "");
-    const limit = Math.min(
-      Math.max(Number(req.query.limit) || 50, 1),
-      100
-    );
-    const offset = Math.max(
-      Number(req.query.offset) || 0,
-      0
-    );
+    if (req.method !== "GET") {
+      res.setHeader("Allow", "GET");
 
-    if (!/^\d+$/.test(userId)) {
+      return res.status(405).json({
+        ok: false,
+        error: "Método não permitido"
+      });
+    }
+
+    res.setHeader("Cache-Control", "no-store");
+
+    /*
+     * 1. Identifica o vendedor autenticado pelo OAuth.
+     */
+    const session = await getAuthenticatedSession(req);
+
+    if (!session) {
+      return res.status(401).json({
+        ok: false,
+        error: "Sessão não autenticada ou expirada"
+      });
+    }
+
+    /*
+     * 2. Valida o anúncio informado.
+     */
+    const itemId = String(
+      req.query.item_id || ""
+    ).toUpperCase();
+
+    if (!/^MLB\d+$/.test(itemId)) {
       return res.status(400).json({
         ok: false,
-        error: "user_id inválido"
+        error: "item_id inválido"
       });
     }
 
-    const databaseUrl = process.env.DATABASE_URL;
-
-    if (!databaseUrl) {
-      return res.status(500).json({
-        ok: false,
-        error: "Conexão com o banco não encontrada"
-      });
-    }
-
-    const sql = neon(databaseUrl);
-
-    const rows = await sql`
-      SELECT
-        ml_user_id,
-        access_token
-      FROM mercado_livre_accounts
-      WHERE ml_user_id = ${userId}
-      LIMIT 1
-    `;
-
-    if (rows.length === 0) {
-      return res.status(404).json({
-        ok: false,
-        error: "Conta Mercado Livre não encontrada"
-      });
-    }
-
-    const accessToken = decryptToken(rows[0].access_token);
-
-    const url = new URL(
-      `https://api.mercadolibre.com/users/${userId}/items/search`
+    const accessToken = await getValidMeliAccessToken(
+      session.mlUserId
     );
 
-    url.searchParams.set("limit", String(limit));
-    url.searchParams.set("offset", String(offset));
+    /*
+     * 3. Consulta o anúncio primeiro para validar
+     * propriedade e descobrir sua categoria.
+     */
+    const itemResult = await getResource(
+      `https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`,
+      accessToken
+    );
 
-    const response = await fetch(url, {
-      method: "GET",
-      headers: {
-        Accept: "application/json",
-        Authorization: `Bearer ${accessToken}`
-      }
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      return res.status(response.status).json({
+    if (!itemResult.ok) {
+      return res.status(itemResult.status || 502).json({
         ok: false,
-        error: "Mercado Livre recusou a consulta",
-        details: data
+        error: "Mercado Livre recusou a consulta do anúncio",
+        status: itemResult.status
+      });
+    }
+
+    const item = itemResult.data;
+
+    /*
+     * 4. Proteção multi-vendedor.
+     */
+    if (
+      !item ||
+      !item.seller_id ||
+      String(item.seller_id) !== String(session.mlUserId)
+    ) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "O anúncio não pertence à conta Mercado Livre autenticada"
+      });
+    }
+
+    const categoryId = String(
+      item.category_id || ""
+    ).toUpperCase();
+
+    if (!/^MLB\d+$/.test(categoryId)) {
+      return res.status(422).json({
+        ok: false,
+        error: "O anúncio não possui categoria válida"
+      });
+    }
+
+    /*
+     * 5. Consulta exclusivamente a categoria.
+     */
+    const categoryResult = await getResource(
+      `https://api.mercadolibre.com/categories/${encodeURIComponent(categoryId)}`,
+      accessToken
+    );
+
+    if (!categoryResult.ok) {
+      return res.status(200).json({
+        ok: true,
+        resource_status: "unavailable",
+        resource_http_status: categoryResult.status,
+        item_id: itemId,
+        category_id: categoryId,
+        category: null
       });
     }
 
     return res.status(200).json({
       ok: true,
-      user_id: userId,
-      paging: data.paging || null,
-      results: data.results || [],
-      orders: data.orders || [],
-      available_orders: data.available_orders || []
+      resource_status: "available",
+      resource_http_status: categoryResult.status,
+      item_id: itemId,
+      category_id: categoryId,
+      category: categoryResult.data
     });
   } catch (error) {
     console.error(
-      "Erro ao consultar anúncios:",
-      error instanceof Error ? error.message : "erro desconhecido"
+      "Erro ao consultar categoria do anúncio:",
+      error instanceof Error
+        ? error.message
+        : "erro desconhecido"
     );
 
     return res.status(500).json({
       ok: false,
-      error: "Erro interno ao consultar anúncios"
+      error: "Erro interno ao consultar categoria"
     });
   }
 }
