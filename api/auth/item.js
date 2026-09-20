@@ -1,15 +1,40 @@
 import { getAuthenticatedSession } from "./session.js";
 import { getValidMeliAccessToken } from "../../lib/meli-token.js";
 
-async function getMercadoLivreResource(url, accessToken) {
+const DESCRIPTION_ALLOWED_BODY_KEYS = new Set([
+  "item_id",
+  "plain_text"
+]);
+
+function normalizeItemId(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase();
+}
+
+async function requestMercadoLivre(
+  url,
+  accessToken,
+  method = "GET",
+  body = undefined
+) {
   try {
-    const response = await fetch(url, {
-      method: "GET",
+    const options = {
+      method,
       headers: {
         Accept: "application/json",
         Authorization: `Bearer ${accessToken}`
       }
-    });
+    };
+
+    if (body !== undefined) {
+      options.headers["Content-Type"] =
+        "application/json";
+
+      options.body = JSON.stringify(body);
+    }
+
+    const response = await fetch(url, options);
 
     let data = null;
 
@@ -19,22 +44,14 @@ async function getMercadoLivreResource(url, accessToken) {
       data = null;
     }
 
-    if (!response.ok) {
-      return {
-        ok: false,
-        http_status: response.status,
-        data: null
-      };
-    }
-
     return {
-      ok: true,
+      ok: response.ok,
       http_status: response.status,
       data
     };
   } catch (error) {
     console.warn(
-      "Erro ao consultar recurso do Mercado Livre:",
+      "Erro ao acessar recurso do Mercado Livre:",
       error instanceof Error
         ? error.message
         : "erro desconhecido"
@@ -48,237 +65,587 @@ async function getMercadoLivreResource(url, accessToken) {
   }
 }
 
-export default async function handler(req, res) {
-  try {
-    if (req.method !== "GET") {
-      res.setHeader("Allow", "GET");
+async function authenticateAndLoadItem(
+  req,
+  itemIdInput
+) {
+  /*
+   * 1. Valida a sessão OAuth do usuário do GPT.
+   */
+  const session = await getAuthenticatedSession(req);
 
-      return res.status(405).json({
-        ok: false,
-        error: "Método não permitido"
-      });
-    }
+  if (!session) {
+    return {
+      error: {
+        status: 401,
+        body: {
+          ok: false,
+          applied: false,
+          verified: false,
+          error:
+            "Sessão não autenticada ou expirada"
+        }
+      }
+    };
+  }
 
-    res.setHeader("Cache-Control", "no-store");
+  /*
+   * 2. Valida o ID do anúncio.
+   */
+  const itemId = normalizeItemId(itemIdInput);
 
-    /*
-     * 1. Valida a sessão OAuth do usuário do GPT.
-     */
-    const session = await getAuthenticatedSession(req);
+  if (!/^MLB\d+$/.test(itemId)) {
+    return {
+      error: {
+        status: 400,
+        body: {
+          ok: false,
+          applied: false,
+          verified: false,
+          error: "item_id inválido"
+        }
+      }
+    };
+  }
 
-    if (!session) {
-      return res.status(401).json({
-        ok: false,
-        error: "Sessão não autenticada ou expirada"
-      });
-    }
-
-    /*
-     * 2. Valida o ID do anúncio.
-     */
-    const itemId = String(
-      req.query.item_id || ""
-    ).toUpperCase();
-
-    if (!/^MLB\d+$/.test(itemId)) {
-      return res.status(400).json({
-        ok: false,
-        error: "item_id inválido"
-      });
-    }
-
-    /*
-     * 3. Define qual conjunto de dados será consultado.
-     *
-     * basic é o padrão para manter compatibilidade
-     * com as chamadas anteriores.
-     */
-    const view = String(
-      req.query.view || "basic"
-    ).toLowerCase();
-
-    const allowedViews = [
-      "basic",
-      "category",
-      "attributes",
-      "technical_specs"
-    ];
-
-    if (!allowedViews.includes(view)) {
-      return res.status(400).json({
-        ok: false,
-        error: "view inválida",
-        allowed_views: allowedViews
-      });
-    }
-
-    /*
-     * 4. Obtém um token válido do Mercado Livre
-     * correspondente ao vendedor da sessão.
-     */
-    const accessToken = await getValidMeliAccessToken(
+  /*
+   * 3. Obtém token válido exclusivamente
+   * da conta autenticada.
+   */
+  const accessToken =
+    await getValidMeliAccessToken(
       session.mlUserId
     );
 
-    /*
-     * 5. Consulta primeiro o anúncio.
-     *
-     * Essa consulta é obrigatória em todas as views,
-     * pois precisamos verificar quem é o proprietário.
-     */
-    const itemResult = await getMercadoLivreResource(
-      `https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`,
-      accessToken
-    );
+  /*
+   * 4. Consulta o anúncio antes de qualquer
+   * leitura complementar ou escrita.
+   */
+  const itemResult = await requestMercadoLivre(
+    `https://api.mercadolibre.com/items/${encodeURIComponent(
+      itemId
+    )}`,
+    accessToken
+  );
 
-    if (!itemResult.ok) {
-      return res
-        .status(itemResult.http_status || 502)
-        .json({
+  if (!itemResult.ok) {
+    return {
+      error: {
+        status: itemResult.http_status || 502,
+        body: {
           ok: false,
-          error: "Mercado Livre recusou a consulta do anúncio",
-          status: itemResult.http_status
-        });
-    }
+          applied: false,
+          verified: false,
+          error:
+            "Mercado Livre recusou a consulta do anúncio",
+          mercado_livre_status:
+            itemResult.http_status,
+          mercado_livre_response:
+            itemResult.data
+        }
+      }
+    };
+  }
 
-    const item = itemResult.data;
+  const item = itemResult.data;
 
-    /*
-     * 6. Proteção multi-vendedor.
-     *
-     * Falha fechada:
-     * sem seller_id ou com vendedor diferente,
-     * nenhum dado complementar é devolvido.
-     */
-    if (
-      !item ||
-      !item.seller_id ||
-      String(item.seller_id) !==
-        String(session.mlUserId)
-    ) {
-      return res.status(403).json({
-        ok: false,
-        error:
-          "O anúncio não pertence à conta Mercado Livre autenticada"
-      });
-    }
+  /*
+   * 5. Proteção multi-vendedor.
+   *
+   * O vendedor é determinado pela sessão +
+   * resposta do Mercado Livre.
+   * Nunca aceitamos seller_id vindo do GPT.
+   */
+  if (
+    !item ||
+    !item.seller_id ||
+    String(item.seller_id) !==
+      String(session.mlUserId)
+  ) {
+    return {
+      error: {
+        status: 403,
+        body: {
+          ok: false,
+          applied: false,
+          verified: false,
+          error:
+            "O anúncio não pertence à conta Mercado Livre autenticada"
+        }
+      }
+    };
+  }
 
-    const categoryId = String(
-      item.category_id || ""
-    ).toUpperCase();
+  return {
+    session,
+    accessToken,
+    itemId,
+    item
+  };
+}
 
-    /*
-     * VIEW: BASIC
-     *
-     * Retorna o anúncio completo e sua descrição.
-     */
-    if (view === "basic") {
-      const descriptionResult =
-        await getMercadoLivreResource(
-          `https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}/description`,
-          accessToken
-        );
+async function handleGet(req, res) {
+  const loaded = await authenticateAndLoadItem(
+    req,
+    req.query.item_id
+  );
 
-      return res.status(200).json({
-        ok: true,
-        view: "basic",
-        item,
-        description_status:
-          descriptionResult.ok
-            ? "available"
-            : "unavailable",
-        description_http_status:
-          descriptionResult.http_status,
-        description: descriptionResult.data
-      });
-    }
+  if (loaded.error) {
+    return res
+      .status(loaded.error.status)
+      .json(loaded.error.body);
+  }
 
-    /*
-     * As demais views dependem de uma categoria válida.
-     */
-    if (!/^MLB\d+$/.test(categoryId)) {
-      return res.status(422).json({
-        ok: false,
-        error:
-          "O anúncio não possui uma categoria válida para esta consulta"
-      });
-    }
+  const {
+    accessToken,
+    itemId,
+    item
+  } = loaded;
 
-    /*
-     * VIEW: CATEGORY
-     */
-    if (view === "category") {
-      const categoryResult =
-        await getMercadoLivreResource(
-          `https://api.mercadolibre.com/categories/${encodeURIComponent(categoryId)}`,
-          accessToken
-        );
+  /*
+   * Mantém compatibilidade com as views
+   * existentes do endpoint.
+   */
+  const view = String(
+    req.query.view || "basic"
+  ).toLowerCase();
 
-      return res.status(200).json({
-        ok: true,
-        view: "category",
-        item_id: itemId,
-        category_id: categoryId,
-        resource_status:
-          categoryResult.ok
-            ? "available"
-            : "unavailable",
-        resource_http_status:
-          categoryResult.http_status,
-        category: categoryResult.data
-      });
-    }
+  const allowedViews = [
+    "basic",
+    "category",
+    "attributes",
+    "technical_specs"
+  ];
 
-    /*
-     * VIEW: ATTRIBUTES
-     */
-    if (view === "attributes") {
-      const attributesResult =
-        await getMercadoLivreResource(
-          `https://api.mercadolibre.com/categories/${encodeURIComponent(categoryId)}/attributes`,
-          accessToken
-        );
+  if (!allowedViews.includes(view)) {
+    return res.status(400).json({
+      ok: false,
+      error: "view inválida",
+      allowed_views: allowedViews
+    });
+  }
 
-      return res.status(200).json({
-        ok: true,
-        view: "attributes",
-        item_id: itemId,
-        category_id: categoryId,
-        resource_status:
-          attributesResult.ok
-            ? "available"
-            : "unavailable",
-        resource_http_status:
-          attributesResult.http_status,
-        attributes: attributesResult.data
-      });
-    }
+  const categoryId = normalizeItemId(
+    item.category_id
+  );
 
-    /*
-     * VIEW: TECHNICAL SPECS
-     */
-    const technicalSpecsResult =
-      await getMercadoLivreResource(
-        `https://api.mercadolibre.com/categories/${encodeURIComponent(categoryId)}/technical_specs/input`,
+  /*
+   * VIEW: BASIC
+   *
+   * Retorna o anúncio completo e sua descrição.
+   */
+  if (view === "basic") {
+    const descriptionResult =
+      await requestMercadoLivre(
+        `https://api.mercadolibre.com/items/${encodeURIComponent(
+          itemId
+        )}/description`,
         accessToken
       );
 
     return res.status(200).json({
       ok: true,
-      view: "technical_specs",
+      view: "basic",
+      item,
+      description_status:
+        descriptionResult.ok
+          ? "available"
+          : "unavailable",
+      description_http_status:
+        descriptionResult.http_status,
+      description: descriptionResult.data
+    });
+  }
+
+  /*
+   * As demais views exigem categoria válida.
+   */
+  if (!/^MLB\d+$/.test(categoryId)) {
+    return res.status(422).json({
+      ok: false,
+      error:
+        "O anúncio não possui uma categoria válida para esta consulta"
+    });
+  }
+
+  /*
+   * VIEW: CATEGORY
+   */
+  if (view === "category") {
+    const categoryResult =
+      await requestMercadoLivre(
+        `https://api.mercadolibre.com/categories/${encodeURIComponent(
+          categoryId
+        )}`,
+        accessToken
+      );
+
+    return res.status(200).json({
+      ok: true,
+      view: "category",
       item_id: itemId,
       category_id: categoryId,
       resource_status:
-        technicalSpecsResult.ok
+        categoryResult.ok
           ? "available"
           : "unavailable",
       resource_http_status:
-        technicalSpecsResult.http_status,
-      technical_specs: technicalSpecsResult.data
+        categoryResult.http_status,
+      category: categoryResult.data
+    });
+  }
+
+  /*
+   * VIEW: ATTRIBUTES
+   */
+  if (view === "attributes") {
+    const attributesResult =
+      await requestMercadoLivre(
+        `https://api.mercadolibre.com/categories/${encodeURIComponent(
+          categoryId
+        )}/attributes`,
+        accessToken
+      );
+
+    return res.status(200).json({
+      ok: true,
+      view: "attributes",
+      item_id: itemId,
+      category_id: categoryId,
+      resource_status:
+        attributesResult.ok
+          ? "available"
+          : "unavailable",
+      resource_http_status:
+        attributesResult.http_status,
+      attributes: attributesResult.data
+    });
+  }
+
+  /*
+   * VIEW: TECHNICAL SPECS
+   */
+  const technicalSpecsResult =
+    await requestMercadoLivre(
+      `https://api.mercadolibre.com/categories/${encodeURIComponent(
+        categoryId
+      )}/technical_specs/input`,
+      accessToken
+    );
+
+  return res.status(200).json({
+    ok: true,
+    view: "technical_specs",
+    item_id: itemId,
+    category_id: categoryId,
+    resource_status:
+      technicalSpecsResult.ok
+        ? "available"
+        : "unavailable",
+    resource_http_status:
+      technicalSpecsResult.http_status,
+    technical_specs:
+      technicalSpecsResult.data
+  });
+}
+
+function validateDescriptionBody(body) {
+  if (
+    !body ||
+    typeof body !== "object" ||
+    Array.isArray(body)
+  ) {
+    throw new Error(
+      "Corpo da solicitação inválido"
+    );
+  }
+
+  /*
+   * Allowlist estrita:
+   * nenhum outro campo pode entrar neste endpoint.
+   */
+  const receivedKeys = Object.keys(body);
+
+  const forbiddenKeys = receivedKeys.filter(
+    (key) =>
+      !DESCRIPTION_ALLOWED_BODY_KEYS.has(key)
+  );
+
+  if (forbiddenKeys.length > 0) {
+    throw new Error(
+      `Campos não autorizados na atualização de descrição: ${forbiddenKeys.join(
+        ", "
+      )}`
+    );
+  }
+
+  const itemId = normalizeItemId(
+    body.item_id
+  );
+
+  if (!/^MLB\d+$/.test(itemId)) {
+    throw new Error("item_id inválido");
+  }
+
+  if (typeof body.plain_text !== "string") {
+    throw new Error(
+      "plain_text deve ser uma string"
+    );
+  }
+
+  /*
+   * Não usamos trim no valor final para não
+   * modificar silenciosamente o texto aprovado.
+   */
+  if (body.plain_text.trim().length === 0) {
+    throw new Error(
+      "A descrição não pode estar vazia"
+    );
+  }
+
+  return {
+    item_id: itemId,
+    plain_text: body.plain_text
+  };
+}
+
+function extractPlainText(description) {
+  if (
+    !description ||
+    typeof description !== "object"
+  ) {
+    return null;
+  }
+
+  if (
+    typeof description.plain_text === "string"
+  ) {
+    return description.plain_text;
+  }
+
+  return null;
+}
+
+async function handlePost(req, res) {
+  let validated;
+
+  /*
+   * BARREIRA 1:
+   * valida a estrutura antes de carregar o anúncio.
+   */
+  try {
+    validated = validateDescriptionBody(
+      req.body
+    );
+  } catch (error) {
+    return res.status(400).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Solicitação inválida"
+    });
+  }
+
+  /*
+   * BARREIRA 2:
+   * autenticação + propriedade do anúncio.
+   */
+  const loaded = await authenticateAndLoadItem(
+    req,
+    validated.item_id
+  );
+
+  if (loaded.error) {
+    return res
+      .status(loaded.error.status)
+      .json(loaded.error.body);
+  }
+
+  const {
+    accessToken,
+    itemId
+  } = loaded;
+
+  /*
+   * Snapshot da descrição antes da alteração.
+   */
+  const beforeResult =
+    await requestMercadoLivre(
+      `https://api.mercadolibre.com/items/${encodeURIComponent(
+        itemId
+      )}/description`,
+      accessToken
+    );
+
+  const beforePlainText =
+    beforeResult.ok
+      ? extractPlainText(beforeResult.data)
+      : null;
+
+  /*
+   * Esta primeira Action de escrita de descrição
+   * trabalha apenas com descrições já existentes.
+   *
+   * Criação de descrição ausente será tratada
+   * separadamente depois.
+   */
+  if (!beforeResult.ok) {
+    return res.status(422).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      item_id: itemId,
+      error:
+        "Não foi possível carregar a descrição atual; nenhuma alteração foi executada",
+      description_http_status:
+        beforeResult.http_status
+    });
+  }
+
+  /*
+   * PAYLOAD MÍNIMO.
+   *
+   * O Mercado Livre recebe somente plain_text.
+   * Nenhum outro campo do anúncio participa.
+   */
+  const updateBody = {
+    plain_text: validated.plain_text
+  };
+
+  /*
+   * Atualiza exclusivamente a descrição existente.
+   */
+  const updateResult =
+    await requestMercadoLivre(
+      `https://api.mercadolibre.com/items/${encodeURIComponent(
+        itemId
+      )}/description?api_version=2`,
+      accessToken,
+      "PUT",
+      updateBody
+    );
+
+  if (!updateResult.ok) {
+    return res.status(
+      updateResult.http_status || 502
+    ).json({
+      ok: false,
+      applied: false,
+      verified: false,
+      item_id: itemId,
+      error:
+        "Mercado Livre recusou a atualização da descrição",
+      mercado_livre_status:
+        updateResult.http_status,
+      mercado_livre_response:
+        updateResult.data,
+      before: {
+        plain_text: beforePlainText
+      },
+      requested: {
+        plain_text: validated.plain_text
+      }
+    });
+  }
+
+  /*
+   * Reconsulta obrigatória.
+   */
+  const afterResult =
+    await requestMercadoLivre(
+      `https://api.mercadolibre.com/items/${encodeURIComponent(
+        itemId
+      )}/description`,
+      accessToken
+    );
+
+  if (!afterResult.ok) {
+    return res.status(200).json({
+      ok: true,
+      applied: true,
+      verified: false,
+      item_id: itemId,
+      before: {
+        plain_text: beforePlainText
+      },
+      requested: {
+        plain_text: validated.plain_text
+      },
+      error:
+        "A descrição foi aceita, mas a verificação posterior falhou",
+      verification_http_status:
+        afterResult.http_status
+    });
+  }
+
+  const afterPlainText =
+    extractPlainText(afterResult.data);
+
+  /*
+   * Comparação literal.
+   *
+   * Não consideramos sucesso verificado apenas
+   * porque o PUT respondeu positivamente.
+   */
+  const verified =
+    afterPlainText === validated.plain_text;
+
+  return res.status(200).json({
+    ok: true,
+    applied: true,
+    verified,
+    item_id: itemId,
+    before: {
+      plain_text: beforePlainText
+    },
+    requested: {
+      plain_text: validated.plain_text
+    },
+    after: {
+      plain_text: afterPlainText
+    },
+    changes: [
+      {
+        field: "description.plain_text",
+        before: beforePlainText,
+        requested: validated.plain_text,
+        after: afterPlainText,
+        verified
+      }
+    ]
+  });
+}
+
+export default async function handler(req, res) {
+  res.setHeader(
+    "Cache-Control",
+    "no-store"
+  );
+
+  try {
+    if (req.method === "GET") {
+      return await handleGet(req, res);
+    }
+
+    if (req.method === "POST") {
+      return await handlePost(req, res);
+    }
+
+    res.setHeader(
+      "Allow",
+      "GET, POST"
+    );
+
+    return res.status(405).json({
+      ok: false,
+      error: "Método não permitido"
     });
   } catch (error) {
     console.error(
-      "Erro ao consultar anúncio:",
+      "Erro no endpoint de anúncio/descrição:",
       error instanceof Error
         ? error.message
         : "erro desconhecido"
@@ -286,7 +653,10 @@ export default async function handler(req, res) {
 
     return res.status(500).json({
       ok: false,
-      error: "Erro interno ao consultar anúncio"
+      applied: false,
+      verified: false,
+      error:
+        "Erro interno no endpoint de anúncio/descrição"
     });
   }
 }
