@@ -1,6 +1,5 @@
-import { neon } from "@neondatabase/serverless";
-import { decryptToken } from "./crypto.js";
 import { getAuthenticatedSession } from "./session.js";
+import { getValidMeliAccessToken } from "../../lib/meli-token.js";
 
 export default async function handler(req, res) {
   try {
@@ -24,49 +23,15 @@ export default async function handler(req, res) {
       });
     }
 
-    const databaseUrl = process.env.DATABASE_URL;
-
-    if (!databaseUrl) {
-      return res.status(500).json({
-        ok: false,
-        error: "server_error"
-      });
-    }
-
-    const sql = neon(databaseUrl);
-
-    const accounts = await sql`
-      SELECT
-        ml_user_id,
-        access_token,
-        token_expires_at
-      FROM mercado_livre_accounts
-      WHERE ml_user_id = ${session.mlUserId}
-      LIMIT 1
-    `;
-
-    if (accounts.length === 0) {
-      return res.status(404).json({
-        ok: false,
-        error: "mercado_livre_account_not_found"
-      });
-    }
-
-    const account = accounts[0];
-
-    if (
-      account.token_expires_at &&
-      new Date(account.token_expires_at).getTime() <= Date.now()
-    ) {
-      return res.status(401).json({
-        ok: false,
-        error: "mercado_livre_token_expired"
-      });
-    }
-
-    const mercadoLivreAccessToken = decryptToken(
-      account.access_token
-    );
+    /*
+     * Obtém o token atual do Mercado Livre.
+     * Se estiver próximo da expiração, o módulo
+     * faz a renovação automaticamente.
+     */
+    const mercadoLivreAccessToken =
+      await getValidMeliAccessToken(
+        session.mlUserId
+      );
 
     const response = await fetch(
       "https://api.mercadolibre.com/users/me",
@@ -74,7 +39,8 @@ export default async function handler(req, res) {
         method: "GET",
         headers: {
           Accept: "application/json",
-          Authorization: `Bearer ${mercadoLivreAccessToken}`
+          Authorization:
+            `Bearer ${mercadoLivreAccessToken}`
         }
       }
     );
@@ -88,6 +54,11 @@ export default async function handler(req, res) {
       });
     }
 
+    /*
+     * Proteção adicional:
+     * a conta retornada pelo Mercado Livre
+     * precisa ser a mesma vinculada à sessão.
+     */
     if (String(data.id) !== session.mlUserId) {
       return res.status(403).json({
         ok: false,
@@ -105,7 +76,9 @@ export default async function handler(req, res) {
   } catch (error) {
     console.error(
       "Erro na consulta autenticada:",
-      error instanceof Error ? error.message : "erro desconhecido"
+      error instanceof Error
+        ? error.message
+        : "erro desconhecido"
     );
 
     return res.status(500).json({
